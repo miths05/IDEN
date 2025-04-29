@@ -1,6 +1,7 @@
 import pytest
 import json
 import time
+import re
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 
@@ -8,13 +9,19 @@ EMAIL    = "miths.124@gmail.com"
 PASSWORD = "lqAmrlDA"
 BASE_URL = "https://hiring.idenhq.com/"
 
+SESSION_FILE = Path("session.json")
+
 @pytest.fixture(scope="session")
 def browser_context():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        ctx = browser.new_context()
-        yield ctx
-        ctx.close()
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=False)
+        if SESSION_FILE.exists():
+            context = browser.new_context(storage_state=str(SESSION_FILE))
+        else:
+            # fresh context, we'll log in below
+            context = browser.new_context()
+        context.storage_state(path=str(SESSION_FILE))
+        yield context
         browser.close()
 
 @pytest.fixture
@@ -34,18 +41,17 @@ def test_challenge_navigation(page):
     # 2) Hidden‑path to listing
     for step in ("Start Journey", "Continue Search", "Inventory Section"):
         page.get_by_role("button", name=step).click()
-        # Increase wait time to ensure page loads fully
         page.wait_for_timeout(1000)
 
-    # Wait for the page to stabilize and ensure content is loaded
     page.wait_for_load_state("networkidle")
     
-    # 3) Scroll gradually until "ID: 100" appears (or we hit max scrolls)
-    max_scrolls = 30  # Increased max scrolls
+    max_scrolls = 30  
+    found_id_100 = False
+    
     for i in range(max_scrolls):
-        # Check if we've found ID: 100
         if page.query_selector("text=ID: 100"):
             print(f"Found ID: 100 after {i+1} scrolls")
+            found_id_100 = True
             break
             
         # Scroll in smaller increments for better content loading
@@ -56,123 +62,98 @@ def test_challenge_navigation(page):
         if i % 5 == 4:
             page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(1500)
-
-    # 4) Extract cards with improved individual card extraction with updated fields
-    products = page.evaluate(
-        """() => {
-        // Collect every potential "card" element that might contain products
-        const potentialCards = Array.from(document.querySelectorAll('div[class*="card"], div[class*="product"], div[class*="item"], article, section, div[class*="list-item"]'));
-        
-        // More precise ID pattern matching
-        const idPattern = /ID:\\s*(\\d+)/i;
-        
-        // Filter to keep only those with an ID pattern
-        const cards = potentialCards.filter(el => idPattern.test(el.textContent || el.innerText || ''));
-        
-        const result = cards.map(card => {
-          // Get text content for THIS CARD ONLY (not from child elements that might be other cards)
-          const allChildNodes = Array.from(card.childNodes);
-          let cardText = '';
-          allChildNodes.forEach(node => {
-            // Only include direct text nodes or non-card element nodes
-            if (node.nodeType === Node.TEXT_NODE) {
-              cardText += node.textContent + ' ';
-            } else if (node.nodeType === Node.ELEMENT_NODE && 
-                      !node.matches('div[class*="card"], div[class*="product"], div[class*="item"], article, section, div[class*="list-item"]')) {
-              cardText += (node.textContent || node.innerText || '') + ' ';
-            }
-          });
-          
-          // Fallback to direct text content if the above method didn't work
-          if (!cardText.trim()) {
-            cardText = card.textContent || card.innerText || '';
-          }
-          
-          // Extract heading as a primary field
-          let heading = '';
-          const headingElement = card.querySelector('h1, h2, h3, h4, h5, h6, strong, b, .title, [class*="title"], [class*="name"], [class*="product-name"]');
-          if (headingElement) {
-            heading = (headingElement.textContent || headingElement.innerText || '').trim();
-            // Clean the heading - remove ID and other fields if they accidentally got included
-            heading = heading.replace(/ID:\\s*\\d+/i, '').trim();
-            heading = heading.replace(/dimensions:.*$/i, '').trim();
-            heading = heading.replace(/cost:.*$/i, '').trim();
-            heading = heading.replace(/sku:.*$/i, '').trim();
-            heading = heading.replace(/guarantee:.*$/i, '').trim();
-            heading = heading.replace(/details:.*$/i, '').trim();
-            heading = heading.replace(/updated:.*$/i, '').trim();
-          }
-          
-          // Initialize product object with heading as a prominent field and exactly the format needed
-          const product = {
-            heading: heading || 'Unknown Product',
-            id: null,
-            dimensions: '',
-            Details: '',
-            Cost: '',
-            SKU: '',
-            Guarantee: '',
-            Updated: ''
-          };
-          
-          // Extract ID as a primary field from THIS CARD ONLY
-          const idMatch = cardText.match(idPattern);
-          if (idMatch && idMatch[1]) {
-            product.id = Number(idMatch[1]);
-          }
-          
-          // Extract other fields from THIS CARD ONLY with the exact field names requested
-          const dimensionsMatch = cardText.match(/dimensions:?\\s*([^\\n\\r,;]+)/i);
-          if (dimensionsMatch && dimensionsMatch[1]) {
-            product.dimensions = dimensionsMatch[1].trim();
-          }
-          
-          const detailsMatch = cardText.match(/details:?\\s*([^\\n\\r,;]+)/i);
-          if (detailsMatch && detailsMatch[1]) {
-            product.Details = detailsMatch[1].trim();
-          }
-          
-          const costMatch = cardText.match(/cost:?\\s*([^\\n\\r,;]+)/i);
-          if (costMatch && costMatch[1]) {
-            product.Cost = costMatch[1].trim();
-          }
-          
-          const skuMatch = cardText.match(/sku:?\\s*([^\\n\\r,;]+)/i);
-          if (skuMatch && skuMatch[1]) {
-            product.SKU = skuMatch[1].trim();
-          }
-          
-          const guaranteeMatch = cardText.match(/guarantee:?\\s*([^\\n\\r,;]+)/i);
-          if (guaranteeMatch && guaranteeMatch[1]) {
-            product.Guarantee = guaranteeMatch[1].trim();
-          }
-          
-          const updatedMatch = cardText.match(/updated:?\\s*([^\\n\\r,;]+)/i);
-          if (updatedMatch && updatedMatch[1]) {
-            product.Updated = updatedMatch[1].trim();
-          }
-          
-          return product;
-        });
-        
-        // Filter for valid products with IDs up to 100
-        return result
-          .filter(p => typeof p.id === 'number' && !isNaN(p.id) && p.id <= 100)
-          // Sort by ID
-          .sort((a, b) => a.id - b.id);
-      }"""
-    )
     
-    # Add debug information
-    print(f"Found {len(products)} products")
+    if not found_id_100:
+        print("Warning: ID: 100 might not have been found. Continuing with available products.")
     
-    # Take a screenshot for debugging
     page.screenshot(path="debug_screenshot.png")
-
-    # 5) Write to JSON
+    
+    # 4) Extract product data 
+    products = []
+    
+    product_cards = page.query_selector_all('div[class*="card"], div[class*="product"]')
+    print(f"Found {len(product_cards)} potential product cards")
+    
+    for card in product_cards:
+        card_text = card.text_content()
+        
+        id_match = re.search(r'ID:\s*(\d+)', card_text, re.IGNORECASE)
+        if not id_match:
+            continue
+            
+        try:
+            product_id = int(id_match.group(1))
+            if product_id > 100:
+                continue
+        except (ValueError, IndexError):
+            continue
+        
+        print(f"Processing card with ID: {product_id}")
+        
+        heading_match = re.search(r'^(.*?)ID:', card_text, re.DOTALL)
+        heading = heading_match.group(1).strip() if heading_match else "Unknown Product"
+        
+        if not heading or heading == "Unknown Product":
+            heading_element = card.query_selector('h1, h2, h3, h4, h5, h6, strong, b, [class*="title"], [class*="name"]')
+            if heading_element:
+                heading_text = heading_element.text_content().strip()
+                # Check if this text doesn't contain field labels
+                if not any(label in heading_text.lower() for label in ["id:", "dimensions:", "details:", "cost:", "sku:", "guarantee:", "updated:"]):
+                    heading = heading_text
+        
+        # Define regex patterns for each field
+        patterns = {
+            "dimensions": r'Dimensions:\s*([^\n\r]*?)(?=ID:|Dimensions:|Details:|Cost:|SKU:|Guarantee:|Updated:|$)',
+            "details": r'Details:\s*([^\n\r]*?)(?=ID:|Dimensions:|Details:|Cost:|SKU:|Guarantee:|Updated:|$)',
+            "cost": r'Cost:\s*([^\n\r]*?)(?=ID:|Dimensions:|Details:|Cost:|SKU:|Guarantee:|Updated:|$)',
+            "sku": r'SKU:\s*([^\n\r]*?)(?=ID:|Dimensions:|Details:|Cost:|SKU:|Guarantee:|Updated:|$)',
+            "guarantee": r'Guarantee:\s*([^\n\r]*?)(?=ID:|Dimensions:|Details:|Cost:|SKU:|Guarantee:|Updated:|$)',
+            "updated": r'Updated:\s*([^\n\r]*?)(?=ID:|Dimensions:|Details:|Cost:|SKU:|Guarantee:|Updated:|$)'
+        }
+        
+        dimensions = re.search(patterns["dimensions"], card_text, re.IGNORECASE)
+        details = re.search(patterns["details"], card_text, re.IGNORECASE)
+        cost = re.search(patterns["cost"], card_text, re.IGNORECASE)
+        sku = re.search(patterns["sku"], card_text, re.IGNORECASE)
+        guarantee = re.search(patterns["guarantee"], card_text, re.IGNORECASE)
+        updated = re.search(patterns["updated"], card_text, re.IGNORECASE)
+        
+        # Create product object
+        product = {
+            "heading": heading,
+            "id": product_id,
+            "dimensions": dimensions.group(1).strip() if dimensions else "",
+            "Details": details.group(1).strip() if details else "",
+            "Cost": cost.group(1).strip() if cost else "",
+            "SKU": sku.group(1).strip() if sku else "",
+            "Guarantee": guarantee.group(1).strip() if guarantee else "",
+            "Updated": updated.group(1).strip() if updated else ""
+        }
+        
+        print(f"  Extracted dimensions: '{product['dimensions']}'")
+        print(f"  Extracted details: '{product['Details']}'")
+        print(f"  Extracted cost: '{product['Cost']}'")
+        print(f"  Extracted SKU: '{product['SKU']}'")
+        
+        products.append(product)
+    
+    products.sort(key=lambda p: p["id"])
+    
     out = Path("products.json")
     out.write_text(json.dumps(products, indent=2), encoding="utf-8")
     print(f"\n✅ Scraped {len(products)} products (ID ≤ 100) → {out.resolve()}\n")
 
-    # 6) Sanity check
     assert products, "No products were scraped!"
+    
+    print(f"Field counts in scraped data:")
+    empty_counts = {
+        "dimensions": sum(1 for p in products if not p.get("dimensions")),
+        "Details": sum(1 for p in products if not p.get("Details")),
+        "Cost": sum(1 for p in products if not p.get("Cost")),
+        "SKU": sum(1 for p in products if not p.get("SKU")),
+        "Guarantee": sum(1 for p in products if not p.get("Guarantee")),
+        "Updated": sum(1 for p in products if not p.get("Updated"))
+    }
+    
+    for field, count in empty_counts.items():
+        print(f"  {field}: {len(products) - count} populated, {count} empty")
